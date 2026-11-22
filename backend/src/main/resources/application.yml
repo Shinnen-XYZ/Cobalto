@@ -1,0 +1,41 @@
+spring:
+  application:
+    name: cobalto-api
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/cobalto}
+    username: ${SPRING_DATASOURCE_USERNAME:cobalto}
+    password: ${SPRING_DATASOURCE_PASSWORD:cobalto_dev_only}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+server:
+  port: ${SERVER_PORT:8080}
+  error:
+    include-message: never
+cobalto:
+  security:
+    jwt-secret: ${COBALTO_JWT_SECRET}
+    mfa-encryption-keys: ${COBALTO_MFA_ENCRYPTION_KEYS}
+    access-token-minutes: ${COBALTO_ACCESS_TOKEN_MINUTES:15}
+  cors:
+    allowed-origins: ${COBALTO_CORS_ALLOWED_ORIGINS:http://localhost:*,http://127.0.0.1:*}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never

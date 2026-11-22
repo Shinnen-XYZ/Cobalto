@@ -1,0 +1,5 @@
+project_id           = "replace-with-your-google-cloud-project-id"
+github_repository    = "replace-with-your-github-owner/repository"
+document_bucket_name = "replace-with-a-globally-unique-private-bucket-name"
+api_hostname         = ""
+notification_channel_ids = []
