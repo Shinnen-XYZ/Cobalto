@@ -1,20 +1,21 @@
-
 package com.cobalto.api.service;
 
 import com.cobalto.api.security.MfaSecretCipher;
 import com.cobalto.api.security.TokenHash;
 import java.time.Instant;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
-import org.springframework.mail.MailException;
-import org.springframework.mail.SimpleMailMessage;
-import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.http.MediaType;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.util.UriComponentsBuilder;
 
 @Service
@@ -30,7 +31,8 @@ public class EmailVerificationOutboxDispatcher {
 
     private final EmailVerificationOutboxCoordinator outboxCoordinator;
     private final MfaSecretCipher secretCipher;
-    private final JavaMailSender mailSender;
+    private final RestClient restClient;
+    private final String apiKey;
     private final String senderAddress;
     private final String verificationUrl;
     private final Duration tokenLifetime;
@@ -38,7 +40,8 @@ public class EmailVerificationOutboxDispatcher {
     public EmailVerificationOutboxDispatcher(
         EmailVerificationOutboxCoordinator outboxCoordinator,
         MfaSecretCipher secretCipher,
-        JavaMailSender mailSender,
+        RestClient.Builder restClientBuilder,
+        @Value("${COBALTO_BREVO_API_KEY}") String apiKey,
         @Value("${cobalto.email-verification.sender-address:cobalto@localhost}")
         String senderAddress,
         @Value("${cobalto.email-verification.frontend-url}")
@@ -48,7 +51,10 @@ public class EmailVerificationOutboxDispatcher {
     ) {
         this.outboxCoordinator = outboxCoordinator;
         this.secretCipher = secretCipher;
-        this.mailSender = mailSender;
+        this.restClient = restClientBuilder
+            .baseUrl("https://api.brevo.com/v3")
+            .build();
+        this.apiKey = apiKey;
         this.senderAddress = senderAddress;
         this.verificationUrl = verificationUrl;
         this.tokenLifetime = tokenLifetime;
@@ -66,9 +72,8 @@ public class EmailVerificationOutboxDispatcher {
 
         Instant now = Instant.now();
 
-        EmailVerificationOutboxCoordinator.Delivery delivery = outboxCoordinator
-            .prepareDelivery(claim, now)
-            .orElse(null);
+        EmailVerificationOutboxCoordinator.Delivery delivery =
+            outboxCoordinator.prepareDelivery(claim, now).orElse(null);
 
         if (delivery == null) {
             outboxCoordinator.cancelClaim(claim, now);
@@ -93,21 +98,6 @@ public class EmailVerificationOutboxDispatcher {
             .encode()
             .toUriString();
 
-        SimpleMailMessage message = new SimpleMailMessage();
-
-        message.setFrom(senderAddress);
-        message.setTo(delivery.recipientEmail());
-        message.setSubject("Verifica tu correo de Cobalto Sandbox");
-
-        message.setText("""
-            Para confirmar que controlas esta dirección, abre este enlace:
-
-            %s
-
-            El enlace vence en %s minutos y solo puede utilizarse una vez.
-            Si no solicitaste esta cuenta, puedes ignorar este mensaje.
-            """.formatted(link, tokenLifetime.toMinutes()));
-
         if (!outboxCoordinator.renewLeaseForSend(
             claim,
             delivery,
@@ -119,7 +109,32 @@ public class EmailVerificationOutboxDispatcher {
 
         try {
 
-            mailSender.send(message);
+            Map<String, Object> payload = Map.of(
+                "sender", Map.of(
+                    "name", "Cobalto",
+                    "email", senderAddress
+                ),
+                "to", List.of(
+                    Map.of("email", delivery.recipientEmail())
+                ),
+                "subject", "Verifica tu correo de Cobalto Sandbox",
+                "textContent", """
+                    Para confirmar que controlas esta dirección, abre este enlace:
+
+                    %s
+
+                    El enlace vence en %s minutos y solo puede utilizarse una vez.
+                    Si no solicitaste esta cuenta, puedes ignorar este mensaje.
+                    """.formatted(link, tokenLifetime.toMinutes())
+            );
+
+            restClient.post()
+                .uri("/smtp/email")
+                .header("api-key", apiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(payload)
+                .retrieve()
+                .toBodilessEntity();
 
             outboxCoordinator.markSent(claim, Instant.now());
 
@@ -128,7 +143,7 @@ public class EmailVerificationOutboxDispatcher {
                 claim.id()
             );
 
-        } catch (MailException exception) {
+        } catch (RestClientException exception) {
 
             int attempt = claim.attempts();
 
@@ -145,7 +160,7 @@ public class EmailVerificationOutboxDispatcher {
             );
 
             LOGGER.error(
-                "SMTP DELIVERY ERROR | item={} | attempt={} | type={} | message={}",
+                "BREVO API DELIVERY ERROR | item={} | attempt={} | type={} | message={}",
                 claim.id(),
                 attempt,
                 exception.getClass().getName(),
