@@ -2,12 +2,18 @@ spring:
   mail:
     host: ${COBALTO_MAIL_HOST:localhost}
     port: ${COBALTO_MAIL_PORT:1025}
+    username: ${COBALTO_MAIL_USERNAME:}
+    password: ${COBALTO_MAIL_PASSWORD:}
     properties:
       mail:
         smtp:
-          auth: false
+          auth: true
           starttls:
-            enable: false
+            enable: true
+            required: true
+          connectiontimeout: 10000
+          timeout: 10000
+          writetimeout: 10000
           connectiontimeout: 10000
           timeout: 10000
           writetimeout: 10000
