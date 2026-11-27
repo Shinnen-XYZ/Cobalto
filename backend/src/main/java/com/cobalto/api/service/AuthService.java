@@ -93,7 +93,6 @@ public class AuthService {
         ledgerService.post("SANDBOX_CREDIT", user.getId(), "signup-" + user.getId(), null,
             DEFAULT_CURRENCY, "Saldo inicial de prueba", sandboxIssuer, wallet,
             SANDBOX_STARTING_BALANCE);
-        emailVerificationService.issue(user);
         return authResponse(user);
     }
 

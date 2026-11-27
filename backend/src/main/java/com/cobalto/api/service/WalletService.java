@@ -98,9 +98,6 @@ public class WalletService {
         String normalizedEmail = AuthService.normalizeEmail(email);
         AppUser recipient = userRepository.findByEmail(normalizedEmail)
             .orElseThrow(WalletService::recipientNotFound);
-        if (!recipient.isEmailVerified()) {
-            throw recipientNotFound();
-        }
         if (recipient.getId().equals(senderId)) {
             throw new DomainException(HttpStatus.BAD_REQUEST, "SELF_TRANSFER",
                 "No puedes transferir a tu propia cuenta");
@@ -227,9 +224,6 @@ public class WalletService {
 
         AppUser recipient = userRepository.findByEmail(recipientEmail)
             .orElseThrow(WalletService::recipientNotFound);
-        if (!recipient.isEmailVerified()) {
-            throw recipientNotFound();
-        }
         if (recipient.getId().equals(senderId)) {
             throw new DomainException(HttpStatus.BAD_REQUEST, "SELF_TRANSFER",
                 "No puedes transferir a tu propia cuenta");
