@@ -4,6 +4,8 @@ import com.cobalto.api.domain.AccountType;
 import com.cobalto.api.domain.AppUser;
 import com.cobalto.api.domain.LedgerAccount;
 import com.cobalto.api.dto.AuthResponse;
+import com.cobalto.api.dto.EmailChangeRequest;
+import com.cobalto.api.dto.EmailVerificationResponse;
 import com.cobalto.api.dto.LoginRequest;
 import com.cobalto.api.dto.MfaDisableRequest;
 import com.cobalto.api.dto.MfaEnrollmentConfirmRequest;
@@ -17,6 +19,10 @@ import com.cobalto.api.dto.UserResponse;
 import com.cobalto.api.exception.DomainException;
 import com.cobalto.api.repository.AppUserRepository;
 import com.cobalto.api.repository.LedgerAccountRepository;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
+import org.hibernate.exception.ConstraintViolationException;
+import org.springframework.dao.DataIntegrityViolationException;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Locale;
@@ -42,11 +48,15 @@ public class AuthService {
     private final MfaService mfaService;
     private final LedgerService ledgerService;
     private final UserPermissionService permissionService;
+    private final EmailVerificationService emailVerificationService;
+    private final EntityManager entityManager;
 
     public AuthService(AppUserRepository userRepository, LedgerAccountRepository accountRepository,
                        PasswordEncoder passwordEncoder, AuthSessionService sessionService,
                        MfaService mfaService, LedgerService ledgerService,
-                       UserPermissionService permissionService) {
+                       UserPermissionService permissionService,
+                       EmailVerificationService emailVerificationService,
+                       EntityManager entityManager) {
         this.userRepository = userRepository;
         this.accountRepository = accountRepository;
         this.passwordEncoder = passwordEncoder;
@@ -54,6 +64,8 @@ public class AuthService {
         this.mfaService = mfaService;
         this.ledgerService = ledgerService;
         this.permissionService = permissionService;
+        this.emailVerificationService = emailVerificationService;
+        this.entityManager = entityManager;
     }
 
     @Transactional
@@ -64,8 +76,16 @@ public class AuthService {
                 "Ya existe una cuenta con ese correo");
         }
 
-        AppUser user = userRepository.saveAndFlush(new AppUser(
-            request.fullName().trim(), email, passwordEncoder.encode(request.password())));
+        AppUser user;
+        try {
+            user = userRepository.saveAndFlush(new AppUser(
+                request.fullName().trim(), email, passwordEncoder.encode(request.password())));
+        } catch (DataIntegrityViolationException exception) {
+            if (isEmailUniqueViolation(exception)) {
+                throw emailInUse();
+            }
+            throw exception;
+        }
         LedgerAccount wallet = accountRepository.saveAndFlush(new LedgerAccount(
             UUID.randomUUID(), AccountType.WALLET, user.getId(), DEFAULT_CURRENCY));
         LedgerAccount sandboxIssuer = accountRepository.findById(SANDBOX_ISSUER_ID)
@@ -73,6 +93,7 @@ public class AuthService {
         ledgerService.post("SANDBOX_CREDIT", user.getId(), "signup-" + user.getId(), null,
             DEFAULT_CURRENCY, "Saldo inicial de prueba", sandboxIssuer, wallet,
             SANDBOX_STARTING_BALANCE);
+        emailVerificationService.issue(user);
         return authResponse(user);
     }
 
@@ -154,14 +175,88 @@ public class AuthService {
         return toUserResponse(user);
     }
 
+    @Transactional
+    public EmailVerificationResponse changeEmail(UUID userId, EmailChangeRequest request) {
+        AppUser user = userRepository.findById(userId)
+            .orElseThrow(() -> new DomainException(HttpStatus.NOT_FOUND, "USER_NOT_FOUND",
+                "No se encontró el usuario"));
+        if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
+            throw new DomainException(HttpStatus.UNAUTHORIZED, "INVALID_CREDENTIALS",
+                "La contraseña no es válida");
+        }
+
+        boolean mfaRequired = user.isMfaEnabled();
+        if (mfaRequired) {
+            mfaService.verifySensitiveAction(userId, request.mfaFactor());
+        } else if (request.mfaFactor() != null && !request.mfaFactor().isBlank()) {
+            throw new DomainException(HttpStatus.BAD_REQUEST, "MFA_NOT_ENABLED",
+                "Esta cuenta no tiene MFA activado");
+        }
+
+        entityManager.refresh(user, LockModeType.PESSIMISTIC_WRITE);
+        if (user.isMfaEnabled() != mfaRequired) {
+            throw new DomainException(HttpStatus.CONFLICT, "MFA_CONFIGURATION_CHANGED",
+                "La configuración multifactor cambió; inténtalo nuevamente");
+        }
+        if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
+            throw new DomainException(HttpStatus.UNAUTHORIZED, "INVALID_CREDENTIALS",
+                "La contraseña no es válida");
+        }
+
+        String email = normalizeEmail(request.email());
+        if (email.equals(user.getEmail())) {
+            return new EmailVerificationResponse(user.isEmailVerified(),
+                user.isEmailVerified()
+                    ? "El correo ya está verificado."
+                    : "La verificación del correo sigue pendiente.");
+        }
+        if (userRepository.existsByEmail(email)) {
+            throw emailInUse();
+        }
+
+        user.changeEmail(email);
+        try {
+            userRepository.saveAndFlush(user);
+        } catch (DataIntegrityViolationException exception) {
+            if (isEmailUniqueViolation(exception)) {
+                throw emailInUse();
+            }
+            throw exception;
+        }
+        entityManager.refresh(user);
+        if (user.isEmailVerified() || user.getEmailVerifiedAt() != null) {
+            throw new IllegalStateException(
+                "PostgreSQL no invalidó la verificación después del cambio de correo");
+        }
+        emailVerificationService.issue(user);
+        sessionService.revokeAllForUser(userId);
+        return new EmailVerificationResponse(
+            false, "Se inició la verificación de la nueva dirección de correo.");
+    }
+
     public static String normalizeEmail(String email) {
         return email.trim().toLowerCase(Locale.ROOT);
     }
 
     public UserResponse toUserResponse(AppUser user) {
         return new UserResponse(user.getId(), user.getFullName(), user.getEmail(),
-            "NOT_VERIFIED", user.getCreatedAt(), user.isMfaEnabled(),
+            "NOT_VERIFIED", user.getCreatedAt(), user.isEmailVerified(), user.isMfaEnabled(),
             permissionService.hasPermission(user.getId(), UserPermissionService.TRANSFER_REVERSAL));
+    }
+
+    private static DomainException emailInUse() {
+        return new DomainException(HttpStatus.CONFLICT, "EMAIL_IN_USE",
+            "Ya existe una cuenta con ese correo");
+    }
+
+    private static boolean isEmailUniqueViolation(Throwable exception) {
+        for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+            if (cause instanceof ConstraintViolationException violation
+                && "app_users_email_key".equals(violation.getConstraintName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private AuthResponse authResponse(AppUser user) {

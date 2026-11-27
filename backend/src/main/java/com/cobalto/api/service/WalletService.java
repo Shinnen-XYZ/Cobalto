@@ -97,8 +97,10 @@ public class WalletService {
     public RecipientConfirmationResponse confirmRecipient(UUID senderId, String email) {
         String normalizedEmail = AuthService.normalizeEmail(email);
         AppUser recipient = userRepository.findByEmail(normalizedEmail)
-            .orElseThrow(() -> new DomainException(HttpStatus.NOT_FOUND, "RECIPIENT_NOT_FOUND",
-                "No se encontró la cuenta destinataria"));
+            .orElseThrow(WalletService::recipientNotFound);
+        if (!recipient.isEmailVerified()) {
+            throw recipientNotFound();
+        }
         if (recipient.getId().equals(senderId)) {
             throw new DomainException(HttpStatus.BAD_REQUEST, "SELF_TRANSFER",
                 "No puedes transferir a tu propia cuenta");
@@ -224,8 +226,10 @@ public class WalletService {
         }
 
         AppUser recipient = userRepository.findByEmail(recipientEmail)
-            .orElseThrow(() -> new DomainException(HttpStatus.NOT_FOUND, "RECIPIENT_NOT_FOUND",
-                "No se encontró la cuenta destinataria"));
+            .orElseThrow(WalletService::recipientNotFound);
+        if (!recipient.isEmailVerified()) {
+            throw recipientNotFound();
+        }
         if (recipient.getId().equals(senderId)) {
             throw new DomainException(HttpStatus.BAD_REQUEST, "SELF_TRANSFER",
                 "No puedes transferir a tu propia cuenta");
@@ -364,5 +368,10 @@ public class WalletService {
     private static DomainException transferNotFound() {
         return new DomainException(HttpStatus.NOT_FOUND, "TRANSFER_NOT_FOUND",
             "No se encontró la transferencia");
+    }
+
+    private static DomainException recipientNotFound() {
+        return new DomainException(HttpStatus.NOT_FOUND, "RECIPIENT_NOT_FOUND",
+            "No se encontró una cuenta destinataria verificada");
     }
 }

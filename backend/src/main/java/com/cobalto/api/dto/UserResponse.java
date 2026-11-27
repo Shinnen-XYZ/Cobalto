@@ -4,5 +4,5 @@ import java.time.Instant;
 import java.util.UUID;
 
 public record UserResponse(UUID id, String fullName, String email, String kycStatus,
-                           Instant createdAt, boolean mfaEnabled,
+                           Instant createdAt, boolean emailVerified, boolean mfaEnabled,
                            boolean canReverseTransfers) {}

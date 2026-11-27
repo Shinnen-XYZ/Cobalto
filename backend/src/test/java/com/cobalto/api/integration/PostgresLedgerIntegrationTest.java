@@ -1,6 +1,7 @@
 package com.cobalto.api.integration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -29,6 +30,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
+import org.flywaydb.core.api.MigrationVersion;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -38,6 +40,9 @@ class PostgresLedgerIntegrationTest {
     private static EmbeddedPostgres postgres;
     private static DataSource administrator;
     private static DataSource runtime;
+    private static UUID legacyUserId;
+    private static UUID legacyWalletId;
+    private static UUID v10ProcessingOutboxId;
 
     @BeforeAll
     static void startPostgresAndApplyMigrations() throws Exception {
@@ -65,11 +70,23 @@ class PostgresLedgerIntegrationTest {
             .locations("classpath:db/migration")
             .schemas(SCHEMA)
             .defaultSchema(SCHEMA)
+            .target(MigrationVersion.fromVersion("10"))
             .load()
             .migrate();
 
         runtime = postgres.getDatabase(
             "cobalto_app", "postgres", Map.of("currentSchema", SCHEMA));
+        legacyUserId = createUserAndWallet(runtime, false);
+        legacyWalletId = walletId(runtime, legacyUserId);
+        v10ProcessingOutboxId = seedV10ProcessingOutbox(legacyUserId);
+
+        Flyway.configure()
+            .dataSource(migrator)
+            .locations("classpath:db/migration")
+            .schemas(SCHEMA)
+            .defaultSchema(SCHEMA)
+            .load()
+            .migrate();
     }
 
     @AfterAll
@@ -82,13 +99,14 @@ class PostgresLedgerIntegrationTest {
     @Test
     void flywayCreatesTablesAndRuntimeHasOnlyRequiredLedgerAndNotificationPrivileges()
         throws Exception {
-        assertEquals(7, scalarLong(administrator,
+        assertEquals(11, scalarLong(administrator,
             "SELECT count(*) FROM " + SCHEMA + ".flyway_schema_history WHERE success"));
         for (String table : List.of(
             "app_users", "ledger_accounts", "ledger_transactions", "ledger_entries",
             "auth_refresh_sessions", "auth_mfa_login_challenges", "auth_mfa_recovery_codes",
             "app_notifications", "transfer_audit_events", "app_user_permissions",
-            "transfer_reversal_audits")) {
+            "transfer_reversal_audits", "auth_email_verification_tokens",
+            "auth_email_verification_outbox")) {
             assertEquals(1, scalarLong(administrator,
                 "SELECT count(*) FROM information_schema.tables "
                     + "WHERE table_schema = ? AND table_name = ?", SCHEMA, table));
@@ -124,6 +142,30 @@ class PostgresLedgerIntegrationTest {
             "SELECT CASE WHEN has_column_privilege('cobalto_app', ?, 'message', 'UPDATE')"
                 + " THEN 1 ELSE 0 END",
             notifications));
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN has_column_privilege('cobalto_app', ?, "
+                + "'email_verified', 'UPDATE') THEN 1 ELSE 0 END",
+            SCHEMA + ".app_users"));
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN has_column_privilege('cobalto_app', ?, "
+                + "'email_verified', 'INSERT') THEN 1 ELSE 0 END",
+            SCHEMA + ".app_users"));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN has_table_privilege('cobalto_app', ?, 'SELECT')"
+                + " THEN 1 ELSE 0 END",
+            SCHEMA + ".auth_email_verification_tokens"));
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN has_table_privilege('cobalto_app', ?, 'DELETE')"
+                + " THEN 1 ELSE 0 END",
+            SCHEMA + ".auth_email_verification_tokens"));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN has_column_privilege('cobalto_app', ?, "
+                + "'lease_until', 'UPDATE') THEN 1 ELSE 0 END",
+            SCHEMA + ".auth_email_verification_outbox"));
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN has_column_privilege('cobalto_app', ?, "
+                + "'recipient_email', 'UPDATE') THEN 1 ELSE 0 END",
+            SCHEMA + ".auth_email_verification_outbox"));
 
         UUID userId = createUserAndWallet(runtime);
         grantReversalPermission(userId);
@@ -180,6 +222,228 @@ class PostgresLedgerIntegrationTest {
             VALUES (?, ?, ?, ?)
             """, recoveryId, userId, "c".repeat(64), Timestamp.from(now));
         execute(runtime, "DELETE FROM auth_mfa_recovery_codes WHERE id = ?", recoveryId);
+    }
+
+    @Test
+    void v11PreservesExistingSandboxLedgerAndUnverifiedUsers()
+        throws Exception {
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN email_verified THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".app_users WHERE id = ?",
+            legacyUserId));
+        assertEquals(new BigDecimal("100.0000"),
+            walletBalance(runtime, legacyWalletId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT count(*) FROM " + SCHEMA
+                + ".ledger_transactions WHERE actor_user_id = ? AND type = 'SANDBOX_CREDIT'",
+            legacyUserId));
+        assertEquals(2, scalarLong(administrator,
+            "SELECT count(*) FROM " + SCHEMA
+                + ".ledger_entries e JOIN " + SCHEMA
+                + ".ledger_transactions t ON t.id = e.transaction_id "
+                + "WHERE t.actor_user_id = ? AND t.type = 'SANDBOX_CREDIT'",
+            legacyUserId));
+    }
+
+    @Test
+    void v11CountsAnExistingV10ProcessingLeaseAsAnAttempt() throws Exception {
+        assertEquals(1, scalarLong(administrator,
+            "SELECT count(*) FROM " + SCHEMA
+                + ".auth_email_verification_outbox WHERE id = ? "
+                + "AND status = 'PROCESSING' AND attempts = 3",
+            v10ProcessingOutboxId));
+    }
+
+    @Test
+    void runtimeCannotPostDirectTransferToUnverifiedWallet() throws Exception {
+        UUID senderId = createUserAndWallet(runtime);
+        UUID recipientId = createUserAndWallet(runtime, false);
+        UUID senderWalletId = walletId(runtime, senderId);
+        UUID recipientWalletId = walletId(runtime, recipientId);
+        String idempotencyKey = "unverified-" + UUID.randomUUID();
+
+        try (Connection connection = runtime.getConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                 "UPDATE " + SCHEMA
+                     + ".app_users SET email_verified = TRUE WHERE id = ?")) {
+            statement.setObject(1, recipientId);
+            assertThrows(SQLException.class, statement::executeUpdate);
+        }
+
+        assertThrows(SQLException.class, () -> callTransfer(runtime, senderId,
+            idempotencyKey, sha256Hex("unverified-recipient"), senderWalletId,
+            recipientWalletId, BigDecimal.ONE));
+
+        assertEquals(new BigDecimal("100.0000"), walletBalance(runtime, senderWalletId));
+        assertEquals(new BigDecimal("100.0000"), walletBalance(runtime, recipientWalletId));
+        assertEquals(0, scalarLong(administrator,
+            "SELECT count(*) FROM " + SCHEMA
+                + ".ledger_transactions WHERE actor_user_id = ? AND idempotency_key = ?",
+            senderId, idempotencyKey));
+    }
+
+    @Test
+    void runtimeEmailChangeInvalidatesVerificationAndCancelsPendingDelivery()
+        throws Exception {
+        UUID userId = createUserAndWallet(runtime);
+        UUID walletId = walletId(runtime, userId);
+        UUID tokenId = UUID.randomUUID();
+        UUID outboxId = UUID.randomUUID();
+        Instant now = Instant.now();
+        execute(runtime, """
+            INSERT INTO auth_email_verification_tokens
+                (id, user_id, token_hash, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """, tokenId, userId, sha256Hex("previous-email-token"),
+            Timestamp.from(now), Timestamp.from(now.plusSeconds(1800)));
+        execute(runtime, """
+            INSERT INTO auth_email_verification_outbox
+                (id, user_id, token_id, recipient_email, encrypted_token, status, attempts,
+                 created_at, next_attempt_at)
+            VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)
+            """, outboxId, userId, tokenId, userId + "@example.test", new byte[] {1, 2, 3},
+            Timestamp.from(now), Timestamp.from(now));
+
+        execute(runtime, "UPDATE app_users SET email = ? WHERE id = ?",
+            "changed-" + userId + "@example.test", userId);
+
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN email_verified THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".app_users WHERE id = ?", userId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN email_verified_at IS NULL THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".app_users WHERE id = ?", userId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".auth_email_verification_tokens WHERE id = ?", tokenId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN status = 'CANCELLED' AND encrypted_token IS NULL "
+                + "THEN 1 ELSE 0 END FROM " + SCHEMA
+                + ".auth_email_verification_outbox WHERE id = ?", outboxId));
+        assertEquals(new BigDecimal("100.0000"), walletBalance(runtime, walletId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT count(*) FROM " + SCHEMA
+                + ".ledger_transactions WHERE actor_user_id = ?", userId));
+        assertEquals(2, scalarLong(administrator,
+            "SELECT count(*) FROM " + SCHEMA + ".ledger_entries e JOIN " + SCHEMA
+                + ".ledger_transactions t ON t.id = e.transaction_id "
+                + "WHERE t.actor_user_id = ?", userId));
+    }
+
+    @Test
+    void emailChangeCannotPreserveVerificationAndRuntimeCannotSetItDirectly()
+        throws Exception {
+        UUID userId = createUserAndWallet(runtime);
+        execute(administrator, "UPDATE " + SCHEMA
+                + ".app_users SET email = ?, email_verified = TRUE, "
+                + "email_verified_at = now() WHERE id = ?",
+            "replacement-" + userId + "@example.test", userId);
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN email_verified THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".app_users WHERE id = ?", userId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN email_verified_at IS NULL THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".app_users WHERE id = ?", userId));
+
+        assertThrows(SQLException.class, () -> execute(runtime,
+            "UPDATE app_users SET email_verified = TRUE, email_verified_at = now() "
+                + "WHERE id = ?", userId));
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN email_verified THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".app_users WHERE id = ?", userId));
+    }
+
+    @Test
+    void confirmationAndEmailChangeUseConsistentLocksAcrossIndependentConnections()
+        throws Exception {
+        UUID userId = createUserAndWallet(runtime, false);
+        UUID tokenId = UUID.randomUUID();
+        UUID outboxId = UUID.randomUUID();
+        String rawToken = "v11-concurrent-confirmation-" + UUID.randomUUID();
+        Instant now = Instant.now();
+        execute(runtime, """
+            INSERT INTO auth_email_verification_tokens
+                (id, user_id, token_hash, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """, tokenId, userId, sha256Hex(rawToken),
+            Timestamp.from(now), Timestamp.from(now.plusSeconds(1800)));
+        execute(runtime, """
+            INSERT INTO auth_email_verification_outbox
+                (id, user_id, token_id, recipient_email, encrypted_token, status, attempts,
+                 created_at, next_attempt_at)
+            VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)
+            """, outboxId, userId, tokenId, userId + "@example.test", new byte[] {1},
+            Timestamp.from(now), Timestamp.from(now));
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch userLocked = new CountDownLatch(1);
+        CountDownLatch allowEmailChange = new CountDownLatch(1);
+        String applicationName = "v11-confirmation-" + UUID.randomUUID();
+        try {
+            Future<String> emailChange = executor.submit(() -> {
+                try (Connection connection = runtime.getConnection()) {
+                    connection.setAutoCommit(false);
+                    try (PreparedStatement lock = connection.prepareStatement(
+                             "SELECT id FROM app_users WHERE id = ? FOR UPDATE")) {
+                        lock.setObject(1, userId);
+                        try (ResultSet result = lock.executeQuery()) {
+                            assertTrue(result.next());
+                        }
+                    }
+                    userLocked.countDown();
+                    if (!allowEmailChange.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Timed out waiting to change email");
+                    }
+                    try (PreparedStatement update = connection.prepareStatement(
+                             "UPDATE app_users SET email = ? WHERE id = ?")) {
+                        update.setString(1, "v11-changed-" + userId + "@example.test");
+                        update.setObject(2, userId);
+                        update.executeUpdate();
+                    }
+                    connection.commit();
+                    return "COMMITTED";
+                } catch (SQLException exception) {
+                    return exception.getSQLState();
+                }
+            });
+            assertTrue(userLocked.await(10, TimeUnit.SECONDS));
+
+            Future<UUID> confirmation = executor.submit(() -> {
+                try (Connection connection = runtime.getConnection()) {
+                    try (Statement statement = connection.createStatement()) {
+                        statement.execute("SET application_name = '" + applicationName + "'");
+                    }
+                    try (PreparedStatement consume = connection.prepareStatement(
+                             "SELECT consume_email_verification_token(?)")) {
+                        consume.setString(1, sha256Hex(rawToken));
+                        try (ResultSet result = consume.executeQuery()) {
+                            assertTrue(result.next());
+                            return result.getObject(1, UUID.class);
+                        }
+                    }
+                }
+            });
+            assertTrue(awaitLockWait(applicationName),
+                "Confirmation connection did not wait for the user row lock");
+
+            allowEmailChange.countDown();
+            assertEquals("COMMITTED", emailChange.get(15, TimeUnit.SECONDS));
+            assertNull(confirmation.get(15, TimeUnit.SECONDS));
+        } finally {
+            allowEmailChange.countDown();
+            executor.shutdownNow();
+        }
+
+        assertEquals(0, scalarLong(administrator,
+            "SELECT CASE WHEN email_verified THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".app_users WHERE id = ?", userId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END FROM "
+                + SCHEMA + ".auth_email_verification_tokens WHERE id = ?", tokenId));
+        assertEquals(1, scalarLong(administrator,
+            "SELECT CASE WHEN status = 'CANCELLED' AND encrypted_token IS NULL "
+                + "THEN 1 ELSE 0 END FROM " + SCHEMA
+                + ".auth_email_verification_outbox WHERE id = ?", outboxId));
     }
 
     @Test
@@ -394,6 +658,11 @@ class PostgresLedgerIntegrationTest {
     }
 
     private static UUID createUserAndWallet(DataSource dataSource) throws SQLException {
+        return createUserAndWallet(dataSource, true);
+    }
+
+    private static UUID createUserAndWallet(DataSource dataSource, boolean verified)
+        throws SQLException {
         UUID userId = UUID.randomUUID();
         UUID walletId = UUID.randomUUID();
         try (Connection connection = dataSource.getConnection()) {
@@ -416,6 +685,17 @@ class PostgresLedgerIntegrationTest {
             }
             connection.commit();
         }
+        if (verified) {
+            try (Connection connection = administrator.getConnection();
+                 PreparedStatement statement = connection.prepareStatement("""
+                     UPDATE %s.app_users
+                     SET email_verified = TRUE, email_verified_at = now()
+                     WHERE id = ?
+                     """.formatted(SCHEMA))) {
+                statement.setObject(1, userId);
+                statement.executeUpdate();
+            }
+        }
         return userId;
     }
 
@@ -429,6 +709,44 @@ class PostgresLedgerIntegrationTest {
             statement.setTimestamp(3, Timestamp.from(Instant.now()));
             statement.executeUpdate();
         }
+    }
+
+    private static UUID seedV10ProcessingOutbox(UUID userId) throws SQLException {
+        UUID tokenId = UUID.randomUUID();
+        UUID outboxId = UUID.randomUUID();
+        Instant now = Instant.now();
+        try (Connection connection = administrator.getConnection()) {
+            try (PreparedStatement token = connection.prepareStatement("""
+                         INSERT INTO cobalto_integration.auth_email_verification_tokens
+                             (id, user_id, token_hash, created_at, expires_at)
+                         VALUES (?, ?, ?, ?, ?)
+                         """);
+                 PreparedStatement outbox = connection.prepareStatement("""
+                         INSERT INTO cobalto_integration.auth_email_verification_outbox
+                             (id, user_id, token_id, recipient_email, encrypted_token,
+                              status, attempts, created_at, next_attempt_at, lease_token, lease_until)
+                         VALUES (?, ?, ?, ?, ?, 'PROCESSING', 2, ?, ?, ?, ?)
+                         """)) {
+                token.setObject(1, tokenId);
+                token.setObject(2, userId);
+                token.setString(3, sha256Hex("v10-processing-" + outboxId));
+                token.setTimestamp(4, Timestamp.from(now));
+                token.setTimestamp(5, Timestamp.from(now.plusSeconds(1800)));
+                token.executeUpdate();
+
+                outbox.setObject(1, outboxId);
+                outbox.setObject(2, userId);
+                outbox.setObject(3, tokenId);
+                outbox.setString(4, userId + "@example.test");
+                outbox.setBytes(5, new byte[] {1, 2, 3});
+                outbox.setTimestamp(6, Timestamp.from(now));
+                outbox.setTimestamp(7, Timestamp.from(now));
+                outbox.setObject(8, UUID.randomUUID());
+                outbox.setTimestamp(9, Timestamp.from(now.plusSeconds(300)));
+                outbox.executeUpdate();
+            }
+        }
+        return outboxId;
     }
 
     private static UUID walletId(DataSource dataSource, UUID userId) throws SQLException {
@@ -734,6 +1052,21 @@ class PostgresLedgerIntegrationTest {
                 return result.getLong(1);
             }
         }
+    }
+
+    private static boolean awaitLockWait(String applicationName) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            long waiting = scalarLong(administrator, """
+                SELECT count(*) FROM pg_stat_activity
+                WHERE application_name = ? AND wait_event_type = 'Lock'
+                """, applicationName);
+            if (waiting > 0) {
+                return true;
+            }
+            Thread.sleep(10);
+        }
+        return false;
     }
 
     private static String scalarString(DataSource dataSource, String sql, Object... parameters)

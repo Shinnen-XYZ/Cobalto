@@ -1,0 +1,22 @@
+spring:
+  mail:
+    host: ${COBALTO_MAIL_HOST:localhost}
+    port: ${COBALTO_MAIL_PORT:1025}
+    properties:
+      mail:
+        smtp:
+          auth: false
+          starttls:
+            enable: false
+          connectiontimeout: 10000
+          timeout: 10000
+          writetimeout: 10000
+cobalto:
+  email-verification:
+    delivery-enabled: true
+    frontend-url: ${COBALTO_EMAIL_VERIFICATION_URL:http://localhost:8081/verify-email}
+    sender-address: ${COBALTO_EMAIL_FROM:cobalto@localhost}
+    token-lifetime: ${COBALTO_EMAIL_VERIFICATION_TOKEN_LIFETIME:PT30M}
+    resend-cooldown: ${COBALTO_EMAIL_VERIFICATION_RESEND_COOLDOWN:PT1M}
+    max-requests-per-day: ${COBALTO_EMAIL_VERIFICATION_MAX_PER_DAY:6}
+    lease-duration: ${COBALTO_EMAIL_VERIFICATION_LEASE_DURATION:PT5M}

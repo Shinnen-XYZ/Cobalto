@@ -39,7 +39,8 @@ public class SecurityConfig {
             .authorizeHttpRequests(authorize -> authorize
                 .requestMatchers(HttpMethod.POST,
                     "/api/auth/register", "/api/auth/login", "/api/auth/refresh",
-                    "/api/auth/logout", "/api/auth/mfa/verify").permitAll()
+                    "/api/auth/logout", "/api/auth/mfa/verify",
+                    "/api/auth/email-verification/confirm").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/transfers/*/reversal")
                     .hasAuthority("TRANSFER_REVERSAL")
                 .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**").permitAll()

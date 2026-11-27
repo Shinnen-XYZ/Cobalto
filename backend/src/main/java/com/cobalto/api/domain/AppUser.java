@@ -28,6 +28,12 @@ public class AppUser {
     @Column(nullable = false, updatable = false)
     private Instant createdAt;
 
+    @Column(name = "email_verified", nullable = false, insertable = false, updatable = false)
+    private boolean emailVerified;
+
+    @Column(name = "email_verified_at", insertable = false, updatable = false)
+    private Instant emailVerifiedAt;
+
     @Column(name = "mfa_enabled", nullable = false)
     private boolean mfaEnabled;
 
@@ -63,6 +69,8 @@ public class AppUser {
     public String getEmail() { return email; }
     public String getPasswordHash() { return passwordHash; }
     public Instant getCreatedAt() { return createdAt; }
+    public boolean isEmailVerified() { return emailVerified; }
+    public Instant getEmailVerifiedAt() { return emailVerifiedAt; }
     public boolean isMfaEnabled() { return mfaEnabled; }
     public byte[] getMfaSecretEncrypted() { return mfaSecretEncrypted; }
     public byte[] getMfaPendingSecretEncrypted() { return mfaPendingSecretEncrypted; }
@@ -70,6 +78,10 @@ public class AppUser {
     public long getMfaLastCounter() { return mfaLastCounter; }
     public short getMfaFailedAttempts() { return mfaFailedAttempts; }
     public Instant getMfaLockedUntil() { return mfaLockedUntil; }
+
+    public void changeEmail(String email) {
+        this.email = email;
+    }
 
     public void completeMfaEnrollment(byte[] encryptedSecret, long lastCounter) {
         this.mfaSecretEncrypted = encryptedSecret;

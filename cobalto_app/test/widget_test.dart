@@ -7,6 +7,58 @@ import 'package:http/testing.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('email confirmation sends token in POST body and resend uses authenticated session', () async {
+    final requests = <http.Request>[];
+    final tokenStorage = MemoryAuthTokenStorage({
+      'cobalto_access_token': 'access-token',
+      'cobalto_refresh_token': 'refresh-token',
+    });
+    final client = MockClient((request) async {
+      requests.add(request);
+      if (request.url.path == '/api/me') {
+        return http.Response(
+          jsonEncode({
+            'id': 'user-1',
+            'fullName': 'Sandbox User',
+            'email': 'person@example.test',
+            'kycStatus': 'NOT_VERIFIED',
+            'emailVerified': false,
+            'mfaEnabled': false,
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      if (request.url.path == '/api/auth/email-verification/confirm') {
+        expect(request.method, 'POST');
+        expect(jsonDecode(request.body), {
+          'token': 'opaque-verification-token',
+        });
+        return http.Response('{}', 200);
+      }
+      expect(request.url.path, '/api/auth/email-verification/resend');
+      expect(request.method, 'POST');
+      expect(request.headers['authorization'], 'Bearer access-token');
+      return http.Response(
+        jsonEncode({
+          'emailVerified': false,
+          'message':
+              'Si tu cuenta requiere verificación, enviaremos un correo.',
+        }),
+        202,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final api = ApiClient(httpClient: client, tokenStorage: tokenStorage);
+
+    final user = await api.restoreSession();
+    await api.confirmEmailVerification('opaque-verification-token');
+    expect(await api.resendEmailVerification(), isFalse);
+    expect(user?.emailVerified, isFalse);
+    expect(requests, hasLength(3));
+    client.close();
+  });
+
   test(
     'recipient confirmation and transfer use the protected REST contract',
     () async {
@@ -129,6 +181,108 @@ void main() {
   );
 
   testWidgets(
+    'email verification link confirms token and shows completion state',
+    (tester) async {
+      final client = MockClient((request) async {
+        expect(request.url.path, '/api/auth/email-verification/confirm');
+        expect(request.method, 'POST');
+        expect(jsonDecode(request.body), {'token': 'opaque-token'});
+        return http.Response(
+          jsonEncode({
+            'emailVerified': true,
+            'message': 'El correo fue verificado.',
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: EmailVerificationScreen(
+            api: ApiClient(httpClient: client),
+            token: 'opaque-token',
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Correo verificado'), findsOneWidget);
+      expect(
+        find.text('Tu dirección ya puede recibir transferencias Sandbox.'),
+        findsOneWidget,
+      );
+      client.close();
+    },
+  );
+
+  testWidgets('unverified user sees resend action and retry states', (
+    tester,
+  ) async {
+    var resendRequests = 0;
+    final client = MockClient((request) async {
+      if (request.url.path == '/api/wallet') {
+        return http.Response(
+          jsonEncode({
+            'currency': 'GTQ',
+            'balance': 100,
+            'availableBalance': 100,
+            'heldBalance': 0,
+            'movements': [],
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      expect(request.url.path, '/api/auth/email-verification/resend');
+      resendRequests++;
+      return http.Response(
+        jsonEncode({
+          'emailVerified': false,
+          'message':
+              'Si tu cuenta requiere verificación, enviaremos un correo.',
+        }),
+        202,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+    final user = AuthUser(
+      id: 'user-1',
+      fullName: 'Sandbox User',
+      email: 'person@example.test',
+      kycStatus: 'NOT_VERIFIED',
+      emailVerified: false,
+      mfaEnabled: false,
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          api: ApiClient(httpClient: client),
+          user: user,
+          onUserUpdated: (_) {},
+          onSignOut: () async {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('Verifica tu correo para recibir transferencias.'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Reenviar correo'));
+    await tester.pumpAndSettle();
+
+    expect(resendRequests, 1);
+    expect(
+      find.text('Si tu cuenta requiere verificación, enviaremos un correo.'),
+      findsOneWidget,
+    );
+    client.close();
+  });
+
+  testWidgets(
     'login form shows Cobalto identity and validates required input',
     (tester) async {
       await tester.pumpWidget(
@@ -208,6 +362,7 @@ void main() {
               'maskedEmail': 'r***@example.test',
             }),
             200,
+            headers: {'content-type': 'application/json'},
           );
         }
         expect(request.url.path, '/api/transfers');
@@ -263,6 +418,70 @@ void main() {
 
       expect(posted, isTrue);
       expect(result?.amount, 12.35);
+      client.close();
+    },
+  );
+
+  testWidgets(
+    'transfer dialog does not select unverified recipients or post transfers',
+    (tester) async {
+      var posted = false;
+      final client = MockClient((request) async {
+        if (request.url.path == '/api/recipients/confirm') {
+          return http.Response(
+            jsonEncode({
+              'status': 404,
+              'code': 'RECIPIENT_NOT_FOUND',
+              'message': 'No se encontró una cuenta destinataria verificada',
+            }),
+            404,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        posted = true;
+        return http.Response(
+          jsonEncode(_sampleReceipt()),
+          201,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+      final api = ApiClient(httpClient: client);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: FilledButton(
+                onPressed: () => showDialog<void>(
+                  context: context,
+                  builder: (_) => TransferDialog(api: api, mfaEnabled: false),
+                ),
+                child: const Text('Open transfer'),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Open transfer'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byType(TextFormField).at(0),
+        'recipient@example.test',
+      );
+      await tester.tap(find.text('Confirmar destinatario'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('No se encontró una cuenta destinataria verificada'),
+        findsOneWidget,
+      );
+      expect(
+        tester
+            .widget<FilledButton>(find.widgetWithText(FilledButton, 'Enviar'))
+            .onPressed,
+        isNull,
+      );
+      expect(posted, isFalse);
       client.close();
     },
   );

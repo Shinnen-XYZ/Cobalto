@@ -1,34 +1,44 @@
 package com.cobalto.api.integration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cobalto.api.domain.AppUser;
 import com.cobalto.api.domain.MfaRecoveryCode;
 import com.cobalto.api.dto.AuthResponse;
+import com.cobalto.api.dto.EmailChangeRequest;
+import com.cobalto.api.dto.EmailVerificationResponse;
+import com.cobalto.api.dto.RefreshRequest;
 import com.cobalto.api.dto.RegisterRequest;
 import com.cobalto.api.dto.ReversalRequest;
 import com.cobalto.api.dto.TransferReceiptResponse;
 import com.cobalto.api.dto.TransferRequest;
 import com.cobalto.api.dto.TransferResponse;
 import com.cobalto.api.exception.DomainException;
+import com.cobalto.api.security.MfaSecretCipher;
+import com.cobalto.api.security.TokenHash;
 import com.cobalto.api.repository.AppNotificationRepository;
 import com.cobalto.api.repository.AppUserRepository;
 import com.cobalto.api.repository.LedgerAccountRepository;
 import com.cobalto.api.repository.LedgerEntryRepository;
 import com.cobalto.api.repository.MfaRecoveryCodeRepository;
 import com.cobalto.api.service.AuthService;
+import com.cobalto.api.service.EmailVerificationService;
+import com.cobalto.api.service.EmailVerificationOutboxCoordinator;
 import com.cobalto.api.service.NotificationService;
 import com.cobalto.api.service.TransferReversalService;
 import com.cobalto.api.service.WalletService;
-import com.cobalto.api.security.TokenHash;
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.Statement;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -43,15 +53,16 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.http.MediaType;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -62,6 +73,8 @@ class PostgresWalletTransferIntegrationTest {
     private static EmbeddedPostgres postgres;
 
     @Autowired private AuthService authService;
+    @Autowired private EmailVerificationService emailVerificationService;
+    @Autowired private EmailVerificationOutboxCoordinator outboxCoordinator;
     @Autowired private WalletService walletService;
     @Autowired private AppUserRepository userRepository;
     @Autowired private LedgerAccountRepository accountRepository;
@@ -71,6 +84,7 @@ class PostgresWalletTransferIntegrationTest {
     @Autowired private NotificationService notificationService;
     @Autowired private TransferReversalService reversalService;
     @Autowired private JdbcTemplate jdbcTemplate;
+    @Autowired private MfaSecretCipher secretCipher;
     @Autowired private DataSource dataSource;
     @Autowired private MockMvc mockMvc;
 
@@ -85,6 +99,558 @@ class PostgresWalletTransferIntegrationTest {
         String testKey = Base64.getEncoder().encodeToString(new byte[32]);
         properties.add("COBALTO_JWT_SECRET", () -> testKey);
         properties.add("COBALTO_MFA_ENCRYPTION_KEYS", () -> testKey);
+        properties.add("cobalto.email-verification.delivery-enabled", () -> false);
+    }
+
+    @Test
+    void registrationQueuesOnlyEncryptedTokenAndConfirmationConsumesItOnce() {
+        String email = "verify-" + UUID.randomUUID() + "@example.test";
+        AuthResponse response = authService.register(
+            new RegisterRequest("Verification User", email, PASSWORD));
+        AppUser user = userRepository.findByEmail(email).orElseThrow();
+
+        assertFalse(user.isEmailVerified());
+        assertFalse(response.user().emailVerified());
+        assertEquals(new BigDecimal("100.0000"), balance(user));
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_tokens WHERE user_id = ?
+            """, Integer.class, user.getId()));
+
+        String token = verificationToken(user);
+        String tokenHash = jdbcTemplate.queryForObject("""
+            SELECT token_hash FROM auth_email_verification_tokens
+            WHERE user_id = ? AND revoked_at IS NULL
+            """, String.class, user.getId());
+        assertNotEquals(token, tokenHash);
+        assertFalse(response.toString().contains(token));
+
+        emailVerificationService.confirm(token);
+        AppUser verified = userRepository.findById(user.getId()).orElseThrow();
+        assertTrue(verified.isEmailVerified());
+        assertNotNull(verified.getEmailVerifiedAt());
+        assertThrows(DomainException.class, () -> emailVerificationService.confirm(token));
+    }
+
+    @Test
+    void changingVerifiedEmailInvalidatesOldVerificationAndStartsNewFlow()
+        throws Exception {
+        String oldEmail = "email-change-" + UUID.randomUUID() + "@example.test";
+        String newEmail = "new-address-" + UUID.randomUUID() + "@example.test";
+        AuthResponse session = authService.register(
+            new RegisterRequest("Email Change User", oldEmail, PASSWORD));
+        AppUser user = userRepository.findByEmail(oldEmail).orElseThrow();
+        String oldToken = verificationToken(user);
+        verifyEmail(user);
+        AppUser recipient = register("Email Change Recipient");
+        walletService.transfer(user.getId(), UUID.randomUUID(),
+            new TransferRequest(recipient.getEmail(), new BigDecimal("10.00"), PASSWORD, null));
+        BigDecimal senderBalance = balance(user);
+        BigDecimal recipientBalance = balance(recipient);
+        int transactionCount = jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM ledger_transactions WHERE actor_user_id = ?
+            """, Integer.class, user.getId());
+        int entryCount = jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM ledger_entries e
+            JOIN ledger_accounts a ON a.id = e.account_id
+            WHERE a.owner_user_id = ?
+            """, Integer.class, user.getId());
+
+        mockMvc.perform(patch("/api/me/email")
+                .header("Authorization", "Bearer " + session.accessToken())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"email\":\"" + newEmail + "\",\"password\":\""
+                    + PASSWORD + "\"}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.emailVerified").value(false));
+
+        AppUser changedUser = userRepository.findById(user.getId()).orElseThrow();
+        assertEquals(newEmail, changedUser.getEmail());
+        assertFalse(changedUser.isEmailVerified());
+        assertNull(changedUser.getEmailVerifiedAt());
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_tokens
+            WHERE user_id = ? AND consumed_at IS NULL AND revoked_at IS NULL
+            """, Integer.class, changedUser.getId()));
+
+        String newToken = verificationToken(changedUser);
+        assertThrows(DomainException.class,
+            () -> emailVerificationService.confirm(oldToken));
+        emailVerificationService.confirm(newToken);
+        assertTrue(userRepository.findById(user.getId()).orElseThrow().isEmailVerified());
+
+        assertEquals(0, balance(user).compareTo(senderBalance));
+        assertEquals(0, balance(recipient).compareTo(recipientBalance));
+        assertEquals(transactionCount, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM ledger_transactions WHERE actor_user_id = ?
+            """, Integer.class, user.getId()));
+        assertEquals(entryCount, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM ledger_entries e
+            JOIN ledger_accounts a ON a.id = e.account_id
+            WHERE a.owner_user_id = ?
+            """, Integer.class, user.getId()));
+        assertEquals(0, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_refresh_sessions
+            WHERE user_id = ? AND revoked_at IS NULL
+            """, Integer.class, user.getId()));
+        DomainException revokedSession = assertThrows(DomainException.class,
+            () -> authService.refresh(new RefreshRequest(session.refreshToken())));
+        assertEquals("INVALID_REFRESH_TOKEN", revokedSession.getCode());
+    }
+
+    @Test
+    void emailChangeRejectsAnIncorrectCurrentPassword() {
+        AppUser user = registerUnverified("Wrong Password User");
+        String oldEmail = user.getEmail();
+        String requestedEmail = "requested-" + UUID.randomUUID() + "@example.test";
+
+        DomainException exception = assertThrows(DomainException.class,
+            () -> authService.changeEmail(user.getId(),
+                new EmailChangeRequest(requestedEmail, "wrong-password", null)));
+
+        assertEquals("INVALID_CREDENTIALS", exception.getCode());
+        assertEquals(oldEmail, userRepository.findById(user.getId()).orElseThrow().getEmail());
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_tokens
+            WHERE user_id = ? AND revoked_at IS NULL
+            """, Integer.class, user.getId()));
+    }
+
+    @Test
+    void emailChangeRejectsAnIncorrectMfaFactorAndRecordsTheFailure() {
+        AppUser user = registerUnverified("Wrong MFA User");
+        user.completeMfaEnrollment(new byte[] {1, 2, 3}, -1);
+        userRepository.saveAndFlush(user);
+        String invalidRecoveryCode = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        String requestedEmail = "requested-" + UUID.randomUUID() + "@example.test";
+
+        DomainException exception = assertThrows(DomainException.class,
+            () -> authService.changeEmail(user.getId(),
+                new EmailChangeRequest(requestedEmail, PASSWORD, invalidRecoveryCode)));
+
+        assertEquals("INVALID_MFA_CODE", exception.getCode());
+        assertEquals(user.getEmail(), userRepository.findById(user.getId()).orElseThrow().getEmail());
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT mfa_failed_attempts FROM app_users WHERE id = ?
+            """, Integer.class, user.getId()));
+    }
+
+    @Test
+    void validMfaRecoveryCodeAuthorizesEmailChangeAndRevokesSessions() {
+        String oldEmail = "valid-mfa-" + UUID.randomUUID() + "@example.test";
+        AuthResponse session = authService.register(
+            new RegisterRequest("Valid MFA User", oldEmail, PASSWORD));
+        AppUser user = userRepository.findByEmail(oldEmail).orElseThrow();
+        user.completeMfaEnrollment(new byte[] {1, 2, 3}, -1);
+        userRepository.saveAndFlush(user);
+        String recoveryCode = "89ABCDEF0123456789ABCDEF01234567";
+        recoveryCodeRepository.saveAndFlush(new MfaRecoveryCode(
+            UUID.randomUUID(), user.getId(), TokenHash.sha256(recoveryCode), Instant.now()));
+        String newEmail = "new-valid-mfa-" + UUID.randomUUID() + "@example.test";
+
+        EmailVerificationResponse response = authService.changeEmail(user.getId(),
+            new EmailChangeRequest(newEmail, PASSWORD, recoveryCode));
+
+        assertFalse(response.emailVerified());
+        AppUser changedUser = userRepository.findById(user.getId()).orElseThrow();
+        assertEquals(newEmail, changedUser.getEmail());
+        assertFalse(changedUser.isEmailVerified());
+        assertNull(changedUser.getEmailVerifiedAt());
+        assertEquals(0, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_refresh_sessions
+            WHERE user_id = ? AND revoked_at IS NULL
+            """, Integer.class, user.getId()));
+        assertTrue(jdbcTemplate.queryForObject("""
+            SELECT used_at IS NOT NULL FROM auth_mfa_recovery_codes
+            WHERE user_id = ? AND code_hash = ?
+            """, Boolean.class, user.getId(), TokenHash.sha256(recoveryCode)));
+        assertThrows(DomainException.class,
+            () -> authService.refresh(new RefreshRequest(session.refreshToken())));
+        emailVerificationService.confirm(verificationToken(changedUser));
+        assertTrue(userRepository.findById(user.getId()).orElseThrow().isEmailVerified());
+    }
+
+    @Test
+    void changingEmailCancelsPendingDeliveryAndCannotReuseItsToken() {
+        AppUser user = registerUnverified("Pending Email Change");
+        String oldEmail = user.getEmail();
+        String oldToken = verificationToken(user);
+        UUID oldOutboxId = jdbcTemplate.queryForObject("""
+            SELECT id FROM auth_email_verification_outbox
+            WHERE user_id = ? AND status = 'PENDING'
+            """, UUID.class, user.getId());
+        String newEmail = "new-pending-" + UUID.randomUUID() + "@example.test";
+
+        authService.changeEmail(user.getId(),
+            new EmailChangeRequest(newEmail, PASSWORD, null));
+
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE id = ? AND status = 'CANCELLED' AND encrypted_token IS NULL
+                AND lease_token IS NULL AND lease_until IS NULL
+            """, Integer.class, oldOutboxId));
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_tokens
+            WHERE user_id = ? AND token_hash = ? AND revoked_at IS NOT NULL
+            """, Integer.class, user.getId(), TokenHash.sha256(oldToken)));
+        assertEquals(newEmail, jdbcTemplate.queryForObject("""
+            SELECT recipient_email FROM auth_email_verification_outbox
+            WHERE user_id = ? AND status = 'PENDING'
+            """, String.class, user.getId()));
+        assertThrows(DomainException.class, () -> emailVerificationService.confirm(oldToken));
+        AppUser changedUser = userRepository.findById(user.getId()).orElseThrow();
+        emailVerificationService.confirm(verificationToken(changedUser));
+        assertTrue(userRepository.findById(user.getId()).orElseThrow().isEmailVerified());
+        assertNotEquals(oldEmail, changedUser.getEmail());
+    }
+
+    @Test
+    void changingEmailRevokesAClaimAfterPreparationAndBeforeLeaseRenewal()
+        throws Exception {
+        postponeAllPendingDeliveries();
+        AppUser user = registerUnverified("Claimed Email Change");
+        EmailVerificationOutboxCoordinator.Claim claim =
+            outboxCoordinator.claimDue(Instant.now(), 1).get(0);
+        EmailVerificationOutboxCoordinator.Delivery prepared =
+            outboxCoordinator.prepareDelivery(claim, Instant.now()).orElseThrow();
+        assertTrue(outboxCoordinator.renewLeaseForSend(claim, prepared, Instant.now()));
+
+        authService.changeEmail(user.getId(), new EmailChangeRequest(
+            "claimed-change-" + UUID.randomUUID() + "@example.test", PASSWORD, null));
+
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE id = ? AND status = 'CANCELLED' AND encrypted_token IS NULL
+                AND lease_token IS NULL AND lease_until IS NULL
+            """, Integer.class, claim.id()));
+        assertTrue(outboxCoordinator.prepareDelivery(claim, Instant.now()).isEmpty());
+        assertFalse(outboxCoordinator.renewLeaseForSend(claim, prepared, Instant.now()));
+    }
+
+    @Test
+    void concurrentWorkersCannotClaimTheSameOutboxRecord() throws Exception {
+        postponeAllPendingDeliveries();
+        AppUser user = registerUnverified("Concurrent Outbox Claim");
+        var executor = Executors.newFixedThreadPool(2);
+        var start = new CountDownLatch(1);
+        try {
+            Callable<List<EmailVerificationOutboxCoordinator.Claim>> claim = () -> {
+                start.await();
+                return outboxCoordinator.claimDue(Instant.now(), 1);
+            };
+            Future<List<EmailVerificationOutboxCoordinator.Claim>> first =
+                executor.submit(claim);
+            Future<List<EmailVerificationOutboxCoordinator.Claim>> second =
+                executor.submit(claim);
+            start.countDown();
+            List<EmailVerificationOutboxCoordinator.Claim> claims = new ArrayList<>();
+            claims.addAll(first.get(30, TimeUnit.SECONDS));
+            claims.addAll(second.get(30, TimeUnit.SECONDS));
+
+            assertEquals(1, claims.size());
+            assertEquals(user.getId(), jdbcTemplate.queryForObject("""
+                SELECT user_id FROM auth_email_verification_outbox WHERE id = ?
+                """, UUID.class, claims.get(0).id()));
+            assertEquals("PROCESSING", jdbcTemplate.queryForObject("""
+                SELECT status FROM auth_email_verification_outbox WHERE id = ?
+                """, String.class, claims.get(0).id()));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void expiredLeaseRecoversWithBackoffAndFencesTheOldWorker() {
+        postponeAllPendingDeliveries();
+        AppUser user = registerUnverified("Expired Outbox Lease");
+        Instant now = Instant.now();
+        EmailVerificationOutboxCoordinator.Claim original =
+            outboxCoordinator.claimDue(now, 1).get(0);
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_outbox SET lease_until = ?
+            WHERE id = ? AND lease_token = ?
+            """, java.sql.Timestamp.from(now.minusSeconds(1)),
+            original.id(), original.leaseToken());
+
+        assertTrue(outboxCoordinator.claimDue(now, 1).isEmpty());
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE id = ? AND status = 'PENDING' AND attempts = 1
+                AND next_attempt_at > ? AND lease_token IS NULL
+            """, Integer.class, original.id(), java.sql.Timestamp.from(now)));
+
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_outbox SET next_attempt_at = ?
+            WHERE id = ? AND status = 'PENDING'
+            """, java.sql.Timestamp.from(now.minusSeconds(1)), original.id());
+        EmailVerificationOutboxCoordinator.Claim reclaimed =
+            outboxCoordinator.claimDue(now, 1).get(0);
+
+        assertEquals(original.id(), reclaimed.id());
+        assertNotEquals(original.leaseToken(), reclaimed.leaseToken());
+        assertEquals(2, reclaimed.attempts());
+        assertEquals(user.getId(), jdbcTemplate.queryForObject("""
+            SELECT user_id FROM auth_email_verification_outbox WHERE id = ?
+            """, UUID.class, reclaimed.id()));
+
+        outboxCoordinator.markSent(original, now);
+        assertFalse(outboxCoordinator.recordFailure(
+            original, now.plusSeconds(30), "OldWorkerFailure", now));
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE id = ? AND status = 'PROCESSING' AND attempts = 2 AND lease_token = ?
+            """, Integer.class, reclaimed.id(), reclaimed.leaseToken()));
+
+        outboxCoordinator.markSent(reclaimed, now);
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE id = ? AND status = 'SENT' AND encrypted_token IS NULL
+            """, Integer.class, reclaimed.id()));
+    }
+
+    @Test
+    void sentFailedAndCancelledOutboxRowsAreNeverClaimedAgain() {
+        postponeAllPendingDeliveries();
+        AppUser sent = registerUnverified("Outbox Sent Terminal");
+        AppUser failed = registerUnverified("Outbox Failed Terminal");
+        AppUser cancelled = registerUnverified("Outbox Cancelled Terminal");
+
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_outbox
+            SET status = 'SENT', encrypted_token = NULL, sent_at = ?
+            WHERE user_id = ?
+            """, java.sql.Timestamp.from(Instant.now()), sent.getId());
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_outbox
+            SET status = 'FAILED', encrypted_token = NULL
+            WHERE user_id = ?
+            """, failed.getId());
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_outbox
+            SET status = 'CANCELLED', encrypted_token = NULL
+            WHERE user_id = ?
+            """, cancelled.getId());
+
+        assertTrue(outboxCoordinator.claimDue(Instant.now(), 1).isEmpty());
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE user_id = ? AND status = 'SENT'
+            """, Integer.class, sent.getId()));
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE user_id = ? AND status = 'FAILED'
+            """, Integer.class, failed.getId()));
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE user_id = ? AND status = 'CANCELLED'
+            """, Integer.class, cancelled.getId()));
+    }
+
+    @Test
+    void abandonedLeasesReachFiveAttemptsThenFailAndRevokeTheToken() {
+        postponeAllPendingDeliveries();
+        AppUser user = registerUnverified("Outbox Attempt Limit");
+        UUID outboxId = jdbcTemplate.queryForObject("""
+            SELECT id FROM auth_email_verification_outbox WHERE user_id = ?
+            """, UUID.class, user.getId());
+        Instant now = Instant.now();
+
+        for (short attempt = 1; attempt <= 5; attempt++) {
+            jdbcTemplate.update("""
+                UPDATE auth_email_verification_outbox
+                SET next_attempt_at = ?
+                WHERE id = ? AND status = 'PENDING'
+                """, java.sql.Timestamp.from(now.minusSeconds(1)), outboxId);
+            EmailVerificationOutboxCoordinator.Claim claim =
+                outboxCoordinator.claimDue(now, 1).get(0);
+            assertEquals(attempt, claim.attempts());
+            jdbcTemplate.update("""
+                UPDATE auth_email_verification_outbox SET lease_until = ?
+                WHERE id = ? AND lease_token = ?
+                """, java.sql.Timestamp.from(now.minusSeconds(1)), outboxId,
+                claim.leaseToken());
+
+            assertTrue(outboxCoordinator.claimDue(now, 1).isEmpty());
+        }
+
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE id = ? AND status = 'FAILED' AND attempts = 5
+                AND encrypted_token IS NULL AND lease_token IS NULL AND lease_until IS NULL
+            """, Integer.class, outboxId));
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_tokens
+            WHERE user_id = ? AND revoked_at IS NOT NULL
+            """, Integer.class, user.getId()));
+    }
+
+    @Test
+    void smtpFailureUsesBackoffAndPreservesEncryptedTokenForRetry() {
+        postponeAllPendingDeliveries();
+        AppUser user = registerUnverified("Outbox SMTP Retry");
+        Instant now = Instant.now();
+        EmailVerificationOutboxCoordinator.Claim claim =
+            outboxCoordinator.claimDue(now, 1).get(0);
+
+        assertFalse(outboxCoordinator.recordFailure(
+            claim, now.plusSeconds(30), "MailSendException", now));
+        assertEquals(1, jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM auth_email_verification_outbox
+            WHERE id = ? AND status = 'PENDING' AND attempts = 1
+                AND encrypted_token IS NOT NULL AND lease_token IS NULL
+                AND next_attempt_at > ?
+            """, Integer.class, claim.id(), java.sql.Timestamp.from(now)));
+
+        EmailVerificationOutboxCoordinator.Claim retry =
+            outboxCoordinator.claimDue(now.plusSeconds(31), 1).get(0);
+        assertEquals(claim.id(), retry.id());
+        assertEquals(user.getId(), jdbcTemplate.queryForObject("""
+            SELECT user_id FROM auth_email_verification_outbox WHERE id = ?
+            """, UUID.class, retry.id()));
+    }
+
+    @Test
+    void expiredAndRevokedEmailVerificationTokensCannotBeConsumed() {
+        AppUser expiredUser = registerUnverified("Expired Verification");
+        String expiredToken = verificationToken(expiredUser);
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_tokens
+            SET created_at = ?, expires_at = ?
+            WHERE user_id = ?
+            """, java.sql.Timestamp.from(Instant.now().minusSeconds(3600)),
+            java.sql.Timestamp.from(Instant.now().minusSeconds(1)), expiredUser.getId());
+        assertThrows(DomainException.class,
+            () -> emailVerificationService.confirm(expiredToken));
+
+        AppUser revokedUser = registerUnverified("Revoked Verification");
+        String revokedToken = verificationToken(revokedUser);
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_tokens
+            SET revoked_at = ?
+            WHERE user_id = ?
+            """, java.sql.Timestamp.from(Instant.now()), revokedUser.getId());
+        assertThrows(DomainException.class,
+            () -> emailVerificationService.confirm(revokedToken));
+    }
+
+    @Test
+    void resendInvalidatesPreviousTokenAndEnforcesCooldownAndDailyLimit() {
+        AppUser user = registerUnverified("Resend Verification");
+        String originalToken = verificationToken(user);
+
+        DomainException cooldown = assertThrows(DomainException.class,
+            () -> emailVerificationService.resend(user.getId()));
+        assertEquals("EMAIL_VERIFICATION_COOLDOWN", cooldown.getCode());
+
+        for (int index = 0; index < 5; index++) {
+            jdbcTemplate.update("""
+                UPDATE auth_email_verification_tokens
+                SET created_at = ?
+                WHERE user_id = ? AND id = (
+                    SELECT id FROM auth_email_verification_tokens
+                    WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
+                )
+                """, java.sql.Timestamp.from(Instant.now().minusSeconds(120)),
+                user.getId(), user.getId());
+            assertFalse(emailVerificationService.resend(user.getId()).emailVerified());
+        }
+
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_tokens
+            SET created_at = ?
+            WHERE user_id = ? AND id = (
+                SELECT id FROM auth_email_verification_tokens
+                WHERE user_id = ? ORDER BY created_at DESC LIMIT 1
+            )
+            """, java.sql.Timestamp.from(Instant.now().minusSeconds(120)),
+            user.getId(), user.getId());
+        DomainException dailyLimit = assertThrows(DomainException.class,
+            () -> emailVerificationService.resend(user.getId()));
+        assertEquals("EMAIL_VERIFICATION_LIMIT", dailyLimit.getCode());
+
+        String currentToken = verificationToken(user);
+        assertThrows(DomainException.class,
+            () -> emailVerificationService.confirm(originalToken));
+        emailVerificationService.confirm(currentToken);
+        assertTrue(userRepository.findById(user.getId()).orElseThrow().isEmailVerified());
+    }
+
+    @Test
+    void unverifiedRecipientCannotBeConfirmedOrReachTheLedger() {
+        AppUser sender = register("Verified Sender");
+        AppUser recipient = registerUnverified("Unverified Recipient");
+        BigDecimal senderBalance = balance(sender);
+        UUID key = UUID.randomUUID();
+
+        DomainException confirmation = assertThrows(DomainException.class,
+            () -> walletService.confirmRecipient(sender.getId(), recipient.getEmail()));
+        assertEquals("RECIPIENT_NOT_FOUND", confirmation.getCode());
+        DomainException transfer = assertThrows(DomainException.class,
+            () -> walletService.transfer(sender.getId(), key,
+                new TransferRequest(recipient.getEmail(), BigDecimal.ONE, PASSWORD, null)));
+        assertEquals("RECIPIENT_NOT_FOUND", transfer.getCode());
+        assertEquals(senderBalance, balance(sender));
+        assertEquals(0, transferCount(sender.getId(), key));
+        assertEquals(0, countEntriesForTransferAttempt(sender.getId(), key));
+
+        emailVerificationService.confirm(verificationToken(recipient));
+        TransferResponse result = walletService.transfer(
+            sender.getId(), UUID.randomUUID(),
+            new TransferRequest(recipient.getEmail(), BigDecimal.ONE, PASSWORD, null));
+        assertEquals("COMPLETED", result.status());
+    }
+
+    @Test
+    void verificationEndpointsAllowPublicConfirmationAndRequireAuthenticationForResend()
+        throws Exception {
+        String email = "endpoint-" + UUID.randomUUID() + "@example.test";
+        AuthResponse session = authService.register(
+            new RegisterRequest("Endpoint User", email, PASSWORD));
+        AppUser user = userRepository.findByEmail(email).orElseThrow();
+        String token = verificationToken(user);
+
+        mockMvc.perform(post("/api/auth/email-verification/confirm")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"token\":\"" + token + "\"}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.emailVerified").value(true));
+        mockMvc.perform(post("/api/auth/email-verification/resend"))
+            .andExpect(status().isForbidden());
+        mockMvc.perform(post("/api/auth/email-verification/resend")
+                .header("Authorization", "Bearer " + session.accessToken()))
+            .andExpect(status().isAccepted())
+            .andExpect(jsonPath("$.emailVerified").value(true));
+    }
+
+    @Test
+    void concurrentDuplicateRegistrationReturnsOneAccountAndOneConflict() throws Exception {
+        String email = "concurrent-" + UUID.randomUUID() + "@example.test";
+        var executor = Executors.newFixedThreadPool(2);
+        var start = new CountDownLatch(1);
+        try {
+            Callable<String> registration = () -> {
+                start.await();
+                try {
+                    authService.register(new RegisterRequest("Concurrent User", email, PASSWORD));
+                    return "CREATED";
+                } catch (DomainException exception) {
+                    return exception.getCode();
+                }
+            };
+            Future<String> first = executor.submit(registration);
+            Future<String> second = executor.submit(registration);
+            start.countDown();
+            List<String> results = List.of(first.get(30, TimeUnit.SECONDS),
+                second.get(30, TimeUnit.SECONDS));
+
+            assertEquals(1L, results.stream().filter("CREATED"::equals).count());
+            assertEquals(1L, results.stream().filter("EMAIL_IN_USE"::equals).count());
+            AppUser user = userRepository.findByEmail(email).orElseThrow();
+            assertFalse(user.isEmailVerified());
+            assertEquals(1, walletCount(user.getId()));
+            assertEquals(new BigDecimal("100.0000"), balance(user));
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     @AfterAll
@@ -301,6 +867,7 @@ class PostgresWalletTransferIntegrationTest {
             new RegisterRequest("HTTP Unrelated", unrelatedEmail, PASSWORD));
         AppUser sender = userRepository.findByEmail(senderEmail).orElseThrow();
         AppUser recipient = userRepository.findByEmail(recipientEmail).orElseThrow();
+        verifyEmail(recipient);
         TransferResponse transfer = walletService.transfer(
             sender.getId(), UUID.randomUUID(),
             new TransferRequest(recipientEmail, BigDecimal.ONE, PASSWORD, null));
@@ -529,6 +1096,7 @@ class PostgresWalletTransferIntegrationTest {
                 + UUID.randomUUID() + "@example.test", PASSWORD));
         AppUser sender = userRepository.findByEmail(senderEmail).orElseThrow();
         AppUser recipient = userRepository.findByEmail(recipientEmail).orElseThrow();
+        verifyEmail(recipient);
         AppUser operator = userRepository.findByEmail(operatorSession.user().email()).orElseThrow();
         AppUser unrelated = userRepository.findByEmail(unrelatedSession.user().email()).orElseThrow();
         TransferResponse transfer = walletService.transfer(sender.getId(), UUID.randomUUID(),
@@ -579,10 +1147,45 @@ class PostgresWalletTransferIntegrationTest {
     }
 
     private AppUser register(String name) {
+        AppUser user = registerUnverified(name);
+        verifyEmail(user);
+        return userRepository.findById(user.getId()).orElseThrow();
+    }
+
+    private AppUser registerUnverified(String name) {
         String email = name.toLowerCase().replaceAll("[^a-z0-9]+", ".")
             + "." + UUID.randomUUID() + "@example.test";
         authService.register(new RegisterRequest(name, email, PASSWORD));
         return userRepository.findByEmail(email).orElseThrow();
+    }
+
+    private void verifyEmail(AppUser user) {
+        emailVerificationService.confirm(verificationToken(user));
+    }
+
+    private String verificationToken(AppUser user) {
+        byte[] ciphertext = jdbcTemplate.queryForObject("""
+            SELECT o.encrypted_token
+            FROM auth_email_verification_outbox o
+            WHERE o.user_id = ? AND o.status = 'PENDING'
+            ORDER BY o.created_at DESC LIMIT 1
+            """, byte[].class, user.getId());
+        return secretCipher.decrypt(user.getId().toString(), ciphertext);
+    }
+
+    private long walletCount(UUID userId) {
+        return jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM ledger_accounts
+            WHERE owner_user_id = ? AND account_type = 'WALLET'
+            """, Long.class, userId);
+    }
+
+    private int countEntriesForTransferAttempt(UUID actorUserId, UUID idempotencyKey) {
+        return jdbcTemplate.queryForObject("""
+            SELECT count(*) FROM ledger_entries e
+            JOIN ledger_transactions t ON t.id = e.transaction_id
+            WHERE t.actor_user_id = ? AND t.idempotency_key = ?
+            """, Integer.class, actorUserId, idempotencyKey.toString());
     }
 
     private AppUser authorizeReverser(String name) {
@@ -673,6 +1276,19 @@ class PostgresWalletTransferIntegrationTest {
         return jdbcTemplate.queryForObject(
             "SELECT count(*) FROM ledger_entries WHERE transaction_id = ?",
             Integer.class, transactionId);
+    }
+
+    private void postponeAllPendingDeliveries() {
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_outbox
+            SET next_attempt_at = ?
+            WHERE status = 'PENDING'
+            """, java.sql.Timestamp.from(Instant.now().plusSeconds(86_400)));
+        jdbcTemplate.update("""
+            UPDATE auth_email_verification_outbox
+            SET lease_until = ?
+            WHERE status = 'PROCESSING'
+            """, java.sql.Timestamp.from(Instant.now().plusSeconds(86_400)));
     }
 
     private int countUnbalancedTransactions() {

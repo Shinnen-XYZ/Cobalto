@@ -45,6 +45,15 @@ class CobaltoApp extends StatelessWidget {
             path: '/',
             builder: (context, state) => SessionGate(api: api),
           ),
+          GoRoute(
+            path: '/verify-email',
+            builder: (context, state) => EmailVerificationScreen(
+              api: api,
+              token: state.uri.fragment.startsWith('token=')
+                  ? state.uri.fragment.substring('token='.length)
+                  : '',
+            ),
+          ),
         ],
       );
 
@@ -161,6 +170,28 @@ class ApiClient {
     }
     return _saveAuthenticatedSession(response);
   }
+
+  Future<void> confirmEmailVerification(String token) async {
+    await _request(
+      'POST',
+      '/auth/email-verification/confirm',
+      body: {'token': token},
+    );
+  }
+
+  Future<bool> resendEmailVerification() async {
+    final response = await _request('POST', '/auth/email-verification/resend');
+    final emailVerified = response['emailVerified'];
+    if (emailVerified is! bool) {
+      throw const FormatException(
+        'Respuesta de verificación de correo inválida',
+      );
+    }
+    return emailVerified;
+  }
+
+  Future<AuthUser> loadCurrentUser() async =>
+      AuthUser.fromJson(await _request('GET', '/me'));
 
   Future<AuthUser> _authenticate(
     String method,
@@ -419,6 +450,7 @@ class ApiClient {
     '/auth/refresh',
     '/auth/logout',
     '/auth/mfa/verify',
+    '/auth/email-verification/confirm',
   }.contains(path);
 
   Future<void> _clearTokens() async {
@@ -508,6 +540,7 @@ class AuthUser {
     required this.fullName,
     required this.email,
     required this.kycStatus,
+    required this.emailVerified,
     required this.mfaEnabled,
     this.canReverseTransfers = false,
   });
@@ -516,6 +549,7 @@ class AuthUser {
   final String fullName;
   final String email;
   final String kycStatus;
+  final bool emailVerified;
   final bool mfaEnabled;
   final bool canReverseTransfers;
 
@@ -524,6 +558,7 @@ class AuthUser {
     fullName: json['fullName'] as String,
     email: json['email'] as String,
     kycStatus: json['kycStatus'] as String? ?? 'NOT_VERIFIED',
+    emailVerified: json['emailVerified'] as bool? ?? false,
     mfaEnabled: json['mfaEnabled'] as bool? ?? false,
     canReverseTransfers: json['canReverseTransfers'] as bool? ?? false,
   );
@@ -533,7 +568,18 @@ class AuthUser {
     fullName: fullName,
     email: email,
     kycStatus: kycStatus,
+    emailVerified: emailVerified,
     mfaEnabled: enabled,
+    canReverseTransfers: canReverseTransfers,
+  );
+
+  AuthUser withEmailVerified(bool verified) => AuthUser(
+    id: id,
+    fullName: fullName,
+    email: email,
+    kycStatus: kycStatus,
+    emailVerified: verified,
+    mfaEnabled: mfaEnabled,
     canReverseTransfers: canReverseTransfers,
   );
 }
@@ -741,6 +787,118 @@ class _SessionGateState extends State<SessionGate> {
       },
     );
   }
+}
+
+class EmailVerificationScreen extends StatefulWidget {
+  const EmailVerificationScreen({
+    required this.api,
+    required this.token,
+    super.key,
+  });
+
+  final ApiClient api;
+  final String token;
+
+  @override
+  State<EmailVerificationScreen> createState() =>
+      _EmailVerificationScreenState();
+}
+
+class _EmailVerificationScreenState extends State<EmailVerificationScreen> {
+  bool _loading = true;
+  bool _verified = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _confirm();
+  }
+
+  Future<void> _confirm() async {
+    if (widget.token.isEmpty) {
+      setState(() {
+        _loading = false;
+        _error = 'El enlace de verificación no contiene un token válido.';
+      });
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      await widget.api.confirmEmailVerification(widget.token);
+      if (mounted) setState(() => _verified = true);
+    } on ApiException catch (exception) {
+      if (mounted) setState(() => _error = exception.message);
+    } on Exception {
+      if (mounted) {
+        setState(
+          () => _error = 'No se pudo verificar el correo. Inténtalo de nuevo.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    body: SafeArea(
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 430),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const _BrandMark(),
+                const SizedBox(height: 24),
+                Text(
+                  _loading
+                      ? 'Verificando tu correo…'
+                      : _verified
+                      ? 'Correo verificado'
+                      : 'No se pudo verificar',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: _ink,
+                    fontSize: 22,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                if (_loading)
+                  const Center(child: CircularProgressIndicator())
+                else
+                  Text(
+                    _verified
+                        ? 'Tu dirección ya puede recibir transferencias Sandbox.'
+                        : _error ?? 'El enlace ya no es válido.',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: _muted),
+                  ),
+                const SizedBox(height: 20),
+                if (!_loading && !_verified && widget.token.isNotEmpty)
+                  OutlinedButton(
+                    onPressed: _confirm,
+                    child: const Text('Intentar de nuevo'),
+                  ),
+                if (!_loading)
+                  FilledButton(
+                    onPressed: () => context.go('/'),
+                    child: const Text('Volver a Cobalto'),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 class AuthScreen extends StatefulWidget {
@@ -1066,6 +1224,9 @@ class _HomeScreenState extends State<HomeScreen> {
   WalletSnapshot? _wallet;
   bool _loading = true;
   bool _showBalance = true;
+  bool _verificationBusy = false;
+  String? _verificationMessage;
+  String? _verificationError;
   String? _error;
 
   @override
@@ -1090,6 +1251,62 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     } finally {
       if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _resendVerification() async {
+    setState(() {
+      _verificationBusy = true;
+      _verificationMessage = null;
+      _verificationError = null;
+    });
+    try {
+      final verified = await widget.api.resendEmailVerification();
+      if (!mounted) return;
+      if (verified) {
+        widget.onUserUpdated(widget.user.withEmailVerified(true));
+        setState(() => _verificationMessage = 'Tu correo ya está verificado.');
+      } else {
+        setState(
+          () => _verificationMessage =
+              'Si tu cuenta requiere verificación, enviaremos un correo.',
+        );
+      }
+    } on ApiException catch (exception) {
+      if (mounted) setState(() => _verificationError = exception.message);
+    } on Exception {
+      if (mounted) {
+        setState(() => _verificationError = 'No se pudo reenviar el correo.');
+      }
+    } finally {
+      if (mounted) setState(() => _verificationBusy = false);
+    }
+  }
+
+  Future<void> _refreshVerificationStatus() async {
+    setState(() {
+      _verificationBusy = true;
+      _verificationMessage = null;
+      _verificationError = null;
+    });
+    try {
+      final user = await widget.api.loadCurrentUser();
+      if (mounted) {
+        widget.onUserUpdated(user);
+        setState(
+          () => _verificationMessage = user.emailVerified
+              ? 'Tu correo ya está verificado.'
+              : 'Aún falta verificar tu correo.',
+        );
+      }
+    } on ApiException catch (exception) {
+      if (mounted) setState(() => _verificationError = exception.message);
+    } on Exception {
+      if (mounted) {
+        setState(() => _verificationError = 'No se pudo actualizar el estado.');
+      }
+    } finally {
+      if (mounted) setState(() => _verificationBusy = false);
     }
   }
 
@@ -1226,6 +1443,64 @@ class _HomeScreenState extends State<HomeScreen> {
                   'Tu dinero, claro y a tu ritmo.',
                   style: TextStyle(color: _muted),
                 ),
+                if (!widget.user.emailVerified) ...[
+                  const SizedBox(height: 16),
+                  Card(
+                    color: const Color(0xFFFFF7E5),
+                    elevation: 0,
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Verifica tu correo para recibir transferencias.',
+                            style: TextStyle(
+                              color: _ink,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          if (_verificationMessage != null)
+                            Text(
+                              _verificationMessage!,
+                              style: const TextStyle(color: _muted),
+                            ),
+                          if (_verificationError != null)
+                            Text(
+                              _verificationError!,
+                              style: const TextStyle(color: Color(0xFFB3261E)),
+                            ),
+                          Wrap(
+                            spacing: 8,
+                            children: [
+                              TextButton(
+                                onPressed: _verificationBusy
+                                    ? null
+                                    : _resendVerification,
+                                child: _verificationBusy
+                                    ? const SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : const Text('Reenviar correo'),
+                              ),
+                              TextButton(
+                                onPressed: _verificationBusy
+                                    ? null
+                                    : _refreshVerificationStatus,
+                                child: const Text('Actualizar estado'),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 22),
                 _WalletCard(
                   wallet: _wallet,
@@ -2265,6 +2540,10 @@ class _ProfileSheetState extends State<_ProfileSheet> {
           const SizedBox(height: 18),
           _ProfileRow(label: 'Nombre', value: widget.user.fullName),
           _ProfileRow(label: 'Correo', value: widget.user.email),
+          _ProfileRow(
+            label: 'Verificación del correo',
+            value: widget.user.emailVerified ? 'Verificado' : 'Pendiente',
+          ),
           const _ProfileRow(
             label: 'Verificación de identidad',
             value: 'Pendiente',

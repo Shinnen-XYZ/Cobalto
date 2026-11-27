@@ -1,6 +1,8 @@
 package com.cobalto.api.controller;
 
 import com.cobalto.api.dto.AuthResponse;
+import com.cobalto.api.dto.EmailVerificationConfirmRequest;
+import com.cobalto.api.dto.EmailVerificationResponse;
 import com.cobalto.api.dto.LoginRequest;
 import com.cobalto.api.dto.MfaDisableRequest;
 import com.cobalto.api.dto.MfaEnrollmentConfirmRequest;
@@ -11,6 +13,7 @@ import com.cobalto.api.dto.MfaVerificationRequest;
 import com.cobalto.api.dto.RefreshRequest;
 import com.cobalto.api.dto.RegisterRequest;
 import com.cobalto.api.service.AuthService;
+import com.cobalto.api.service.EmailVerificationService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import java.util.UUID;
@@ -28,15 +31,33 @@ import org.springframework.context.annotation.Profile;
 @RequestMapping("/api/auth")
 public class AuthController {
     private final AuthService authService;
+    private final EmailVerificationService emailVerificationService;
 
-    public AuthController(AuthService authService) {
+    public AuthController(AuthService authService, EmailVerificationService emailVerificationService) {
         this.authService = authService;
+        this.emailVerificationService = emailVerificationService;
     }
 
     @PostMapping("/register")
     @ResponseStatus(HttpStatus.CREATED)
     public AuthResponse register(@Valid @RequestBody RegisterRequest request) {
         return authService.register(request);
+    }
+
+    @PostMapping("/email-verification/confirm")
+    public EmailVerificationResponse confirmEmail(
+        @Valid @RequestBody EmailVerificationConfirmRequest request
+    ) {
+        emailVerificationService.confirm(request.token());
+        return new EmailVerificationResponse(true, "El correo fue verificado.");
+    }
+
+    @PostMapping("/email-verification/resend")
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    public EmailVerificationResponse resendEmail(
+        @AuthenticationPrincipal UUID userId
+    ) {
+        return emailVerificationService.resend(userId);
     }
 
     @PostMapping("/login")

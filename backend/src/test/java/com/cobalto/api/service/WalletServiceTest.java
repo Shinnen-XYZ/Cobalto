@@ -98,6 +98,7 @@ class WalletServiceTest {
         UUID recipientAccountId = UUID.randomUUID();
         AppUser recipient = org.mockito.Mockito.mock(AppUser.class);
         when(recipient.getId()).thenReturn(recipientId);
+        when(recipient.isEmailVerified()).thenReturn(true);
         LedgerAccount sender = new LedgerAccount(senderAccountId, AccountType.WALLET, SENDER_ID, "GTQ");
         LedgerAccount destination = new LedgerAccount(recipientAccountId, AccountType.WALLET, recipientId, "GTQ");
 
@@ -116,6 +117,23 @@ class WalletServiceTest {
             SENDER_ID, KEY, new TransferRequest("recipient@example.com", AMOUNT, "password", null)));
 
         assertEquals("INSUFFICIENT_FUNDS", exception.getCode());
+        verify(ledgerService, never()).post(
+            anyString(), any(), anyString(), any(), anyString(), anyString(), any(), any(), any());
+    }
+
+    @Test
+    void unverifiedRecipientIsRejectedBeforeWalletLookupOrLedgerPosting() {
+        AppUser recipient = org.mockito.Mockito.mock(AppUser.class);
+        when(recipient.isEmailVerified()).thenReturn(false);
+        when(userRepository.findByEmail("recipient@example.com"))
+            .thenReturn(Optional.of(recipient));
+
+        DomainException exception = assertThrows(DomainException.class,
+            () -> walletService.transfer(SENDER_ID, KEY,
+                new TransferRequest("recipient@example.com", AMOUNT, "password", null)));
+
+        assertEquals("RECIPIENT_NOT_FOUND", exception.getCode());
+        verify(accountRepository, never()).findByOwnerUserIdAndCurrency(any(), anyString());
         verify(ledgerService, never()).post(
             anyString(), any(), anyString(), any(), anyString(), anyString(), any(), any(), any());
     }
