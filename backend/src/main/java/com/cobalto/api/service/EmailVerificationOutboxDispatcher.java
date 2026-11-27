@@ -1,4 +1,4 @@
-```java
+
 package com.cobalto.api.service;
 
 import com.cobalto.api.security.MfaSecretCipher;
@@ -155,4 +155,3 @@ public class EmailVerificationOutboxDispatcher {
         }
     }
 }
-```
