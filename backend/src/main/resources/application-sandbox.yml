@@ -14,9 +14,7 @@ spring:
           connectiontimeout: 10000
           timeout: 10000
           writetimeout: 10000
-          connectiontimeout: 10000
-          timeout: 10000
-          writetimeout: 10000
+          
 cobalto:
   email-verification:
     delivery-enabled: true
