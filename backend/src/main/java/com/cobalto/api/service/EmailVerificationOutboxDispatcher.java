@@ -1,3 +1,4 @@
+```java
 package com.cobalto.api.service;
 
 import com.cobalto.api.security.MfaSecretCipher;
@@ -19,8 +20,11 @@ import org.springframework.web.util.UriComponentsBuilder;
 @Service
 @Profile("!migrate")
 @ConditionalOnProperty(
-    name = "cobalto.email-verification.delivery-enabled", havingValue = "true")
+    name = "cobalto.email-verification.delivery-enabled",
+    havingValue = "true"
+)
 public class EmailVerificationOutboxDispatcher {
+
     private static final Logger LOGGER =
         LoggerFactory.getLogger(EmailVerificationOutboxDispatcher.class);
 
@@ -37,8 +41,10 @@ public class EmailVerificationOutboxDispatcher {
         JavaMailSender mailSender,
         @Value("${cobalto.email-verification.sender-address:cobalto@localhost}")
         String senderAddress,
-        @Value("${cobalto.email-verification.frontend-url}") String verificationUrl,
-        @Value("${cobalto.email-verification.token-lifetime:PT30M}") Duration tokenLifetime
+        @Value("${cobalto.email-verification.frontend-url}")
+        String verificationUrl,
+        @Value("${cobalto.email-verification.token-lifetime:PT30M}")
+        Duration tokenLifetime
     ) {
         this.outboxCoordinator = outboxCoordinator;
         this.secretCipher = secretCipher;
@@ -57,29 +63,42 @@ public class EmailVerificationOutboxDispatcher {
     }
 
     private void deliver(EmailVerificationOutboxCoordinator.Claim claim) {
+
         Instant now = Instant.now();
+
         EmailVerificationOutboxCoordinator.Delivery delivery = outboxCoordinator
             .prepareDelivery(claim, now)
             .orElse(null);
+
         if (delivery == null) {
             outboxCoordinator.cancelClaim(claim, now);
             return;
         }
-        String token = secretCipher.decrypt(delivery.userId().toString(),
-            delivery.encryptedToken());
+
+        String token = secretCipher.decrypt(
+            delivery.userId().toString(),
+            delivery.encryptedToken()
+        );
+
         if (!TokenHash.sha256(token).equals(delivery.tokenHash())) {
             outboxCoordinator.cancelClaim(claim, Instant.now());
-            throw new IllegalStateException("Email verification outbox token hash mismatch");
+            throw new IllegalStateException(
+                "Email verification outbox token hash mismatch"
+            );
         }
+
         String link = UriComponentsBuilder.fromUriString(verificationUrl)
             .fragment("token=" + token)
             .build()
             .encode()
             .toUriString();
+
         SimpleMailMessage message = new SimpleMailMessage();
+
         message.setFrom(senderAddress);
         message.setTo(delivery.recipientEmail());
         message.setSubject("Verifica tu correo de Cobalto Sandbox");
+
         message.setText("""
             Para confirmar que controlas esta dirección, abre este enlace:
 
@@ -89,22 +108,51 @@ public class EmailVerificationOutboxDispatcher {
             Si no solicitaste esta cuenta, puedes ignorar este mensaje.
             """.formatted(link, tokenLifetime.toMinutes()));
 
-        if (!outboxCoordinator.renewLeaseForSend(claim, delivery, Instant.now())) {
+        if (!outboxCoordinator.renewLeaseForSend(
+            claim,
+            delivery,
+            Instant.now()
+        )) {
             outboxCoordinator.cancelClaim(claim, Instant.now());
             return;
         }
 
         try {
+
             mailSender.send(message);
+
             outboxCoordinator.markSent(claim, Instant.now());
+
+            LOGGER.info(
+                "Email verification delivered successfully. Item: {}",
+                claim.id()
+            );
+
         } catch (MailException exception) {
+
             int attempt = claim.attempts();
-            long delaySeconds = Math.min(3600, 30L << Math.min(attempt - 1, 7));
+
+            long delaySeconds = Math.min(
+                3600,
+                30L << Math.min(attempt - 1, 7)
+            );
+
             outboxCoordinator.recordFailure(
-                claim, Instant.now().plusSeconds(delaySeconds),
-                exception.getClass().getSimpleName(), Instant.now());
-            LOGGER.warn("Email verification delivery failed for outbox item {} on attempt {}",
-                claim.id(), attempt);
+                claim,
+                Instant.now().plusSeconds(delaySeconds),
+                exception.getClass().getSimpleName(),
+                Instant.now()
+            );
+
+            LOGGER.error(
+                "SMTP DELIVERY ERROR | item={} | attempt={} | type={} | message={}",
+                claim.id(),
+                attempt,
+                exception.getClass().getName(),
+                exception.getMessage(),
+                exception
+            );
         }
     }
 }
+```
